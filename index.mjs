@@ -1082,8 +1082,9 @@ export async function LightVelaAuthPlugin({ client, magpie } = {}, options = {})
     } catch {}
   }
   // 积分读一次缓存几分钟，Providers 页面反复刷时不去打平台接口。
-  let cachedUsage = null
-  let cachedAt = 0
+  // 缓存必须按账号分开：key 用该账号自己的会话 token——共用一份缓存的话，
+  // 先刷出来的账号会把名字和积分盖到其他账号的卡片上（v0.2.2 的 bug）。
+  const usageCache = new Map()
 
   return {
     async config(cfg) {
@@ -1245,14 +1246,14 @@ export async function LightVelaAuthPlugin({ client, magpie } = {}, options = {})
         const meta = metaOf(auth)
         if (!auth?.access) return null
         if (!meta.token) return { plan: "LightVela", signIn: "kept" }
-        if (cachedUsage && Date.now() - cachedAt < USAGE_TTL) return cachedUsage
+        const hit = usageCache.get(meta.token)
+        if (hit && Date.now() - hit.at < USAGE_TTL) return hit.value
         const ed = edOf(meta)
         try {
           const got = await readUsage(ed, meta.token)
           if (!got) return { plan: "LightVela", signIn: "kept" }
           const out = { ...got, ...(auth.accountId ? { user: String(auth.accountId) } : {}), signIn: "kept" }
-          cachedUsage = out
-          cachedAt = Date.now()
+          usageCache.set(meta.token, { at: Date.now(), value: out })
           return out
         } catch (e) {
           if (e?.status === 401) {

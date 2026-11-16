@@ -1,6 +1,6 @@
 {
   "name": "magpie-lightvela-plus",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Sign in to a LightVela account (China edition lightvela.com or international edition lightvela.ai) and use its models from OpenCode or magpie, with plan credits display and daily check-in",
   "type": "module",
   "main": "./opencode.mjs",
