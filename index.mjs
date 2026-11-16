@@ -5,10 +5,11 @@
 //   - 国际版（lightvela.ai）：只有 Google 登录，在网页登录后粘贴会话 token
 //     （lc_session）；实例读取通道不可用时，还可以直接粘贴 token + API key。
 //
-// 登录后插件会把账号里那个 OpenAI 兼容端点的 API key 读出来，交给 magpie
-// 当一个普通 provider 用 —— 不用再手动走「云存储 → Agent 数据 → 显示隐藏
-// 文件 → 下载 .env → 找 key」那一串。会话 token 只用来读你自己账号的实例
-// 配置、积分与活跃进度，不外发。
+// 登录后插件会自动把账号里那个 OpenAI 兼容端点的 API key 读出来，交给
+// magpie 当一个普通 provider 用 —— 不用再手动走「云存储 → 下载 .env →
+// 找 key」那一串。自动读取走的正是控制台「云存储」同款的文件通道
+// （tat/session + websocket + BSON 帧），debug/exec 只作回退。会话 token
+// 只用来读你自己账号的实例配置、积分与活跃进度，不外发。
 //
 // 额度查询、每日打卡（活跃 + 续期奖励领取）两个版本共用同一套逻辑，只是
 // 接口域名不同。本插件合并自社区插件 magpie-lightvela（ikashana，MIT）
@@ -134,9 +135,363 @@ async function pickInstance(ed, token) {
   return running ?? usable[0]
 }
 
+// ------------------------------------------------------------ 极简 BSON 编解码
+// 文件通道的请求/响应帧是 BSON 文档。插件保持零依赖，这里只实现通道用到的
+// 类型：double / string / 子文档 / 数组 / Binary / bool / 时间戳 / null /
+// int32 / int64 / decimal128（近似读成 number）。
+class BsonWriter {
+  constructor() {
+    this.bytes = []
+  }
+  u8(v) {
+    this.bytes.push(v & 0xff)
+  }
+  i32(v) {
+    const b = new Uint8Array(4)
+    new DataView(b.buffer).setInt32(0, v, true)
+    this.bytes.push(...b)
+  }
+  f64(v) {
+    const b = new Uint8Array(8)
+    new DataView(b.buffer).setFloat64(0, v, true)
+    this.bytes.push(...b)
+  }
+  raw(arr) {
+    for (const x of arr) this.bytes.push(x)
+  }
+  cstr(s) {
+    this.raw(new TextEncoder().encode(s))
+    this.u8(0)
+  }
+  str(s) {
+    const e = new TextEncoder().encode(s)
+    this.i32(e.length + 1)
+    this.raw(e)
+    this.u8(0)
+  }
+}
+
+function bsonElement(w, name, value) {
+  if (typeof value === "string") {
+    w.u8(0x02)
+    w.cstr(name)
+    w.str(value)
+  } else if (typeof value === "boolean") {
+    w.u8(0x08)
+    w.cstr(name)
+    w.u8(value ? 1 : 0)
+  } else if (typeof value === "number") {
+    if (Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) {
+      w.u8(0x10)
+      w.cstr(name)
+      w.i32(value)
+    } else {
+      w.u8(0x01)
+      w.cstr(name)
+      w.f64(value)
+    }
+  } else if (value === null || value === undefined) {
+    w.u8(0x0a)
+    w.cstr(name)
+  } else if (value instanceof Uint8Array) {
+    w.u8(0x05)
+    w.cstr(name)
+    w.i32(value.length)
+    w.u8(0)
+    w.raw(value)
+  } else if (Array.isArray(value)) {
+    w.u8(0x04)
+    w.cstr(name)
+    const sub = {}
+    value.forEach((v, i) => (sub[String(i)] = v))
+    w.raw(bsonEncode(sub))
+  } else if (typeof value === "object") {
+    w.u8(0x03)
+    w.cstr(name)
+    w.raw(bsonEncode(value))
+  } else {
+    throw new Error("bson: unsupported value type")
+  }
+}
+
+function bsonEncode(doc) {
+  const body = new BsonWriter()
+  for (const [k, v] of Object.entries(doc)) bsonElement(body, k, v)
+  const head = new BsonWriter()
+  head.i32(body.bytes.length + 5)
+  const out = new Uint8Array(4 + body.bytes.length + 1)
+  out.set(head.bytes, 0)
+  out.set(body.bytes, 4)
+  out[out.length - 1] = 0
+  return out
+}
+
+function bsonDecode(input, offset = 0) {
+  const u8 = input instanceof Uint8Array ? input : new Uint8Array(input)
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength)
+  const total = dv.getInt32(offset, true)
+  const end = offset + total - 1
+  let p = offset + 4
+  const out = {}
+  const dec = new TextDecoder()
+  const readCStr = () => {
+    const s = p
+    while (u8[p] !== 0) p++
+    const str = dec.decode(u8.subarray(s, p))
+    p++
+    return str
+  }
+  const readStr = () => {
+    const n = dv.getInt32(p, true)
+    p += 4
+    const str = dec.decode(u8.subarray(p, p + n - 1))
+    p += n
+    return str
+  }
+  while (p < end) {
+    const type = u8[p++]
+    const name = readCStr()
+    switch (type) {
+      case 0x01:
+        out[name] = dv.getFloat64(p, true)
+        p += 8
+        break
+      case 0x02:
+        out[name] = readStr()
+        break
+      case 0x03: {
+        const sub = bsonDecode(u8, p)
+        out[name] = sub.value
+        p += sub.length
+        break
+      }
+      case 0x04: {
+        const sub = bsonDecode(u8, p)
+        const arr = []
+        for (const k of Object.keys(sub.value).sort((a, b) => Number(a) - Number(b))) {
+          arr.push(sub.value[k])
+        }
+        out[name] = arr
+        p += sub.length
+        break
+      }
+      case 0x05: {
+        const n = dv.getInt32(p, true)
+        p += 4
+        const subtype = u8[p++]
+        if (subtype === 2) {
+          const inner = dv.getInt32(p, true)
+          p += 4
+          out[name] = u8.slice(p, p + inner)
+          p += inner
+        } else {
+          out[name] = u8.slice(p, p + n)
+          p += n
+        }
+        break
+      }
+      case 0x07:
+        out[name] = [...u8.subarray(p, p + 12)].map((x) => x.toString(16).padStart(2, "0")).join("")
+        p += 12
+        break
+      case 0x08:
+        out[name] = u8[p++] !== 0
+        break
+      case 0x09:
+      case 0x11:
+      case 0x12:
+        out[name] = Number(dv.getBigInt64(p, true))
+        p += 8
+        break
+      case 0x0a:
+        out[name] = null
+        break
+      case 0x0b:
+        readCStr()
+        readCStr()
+        out[name] = null
+        break
+      case 0x0d:
+        out[name] = readStr()
+        break
+      case 0x0f: {
+        const n = dv.getInt32(p, true)
+        p += n
+        out[name] = null
+        break
+      }
+      case 0x10:
+        out[name] = dv.getInt32(p, true)
+        p += 4
+        break
+      case 0x13:
+        out[name] = dv.getFloat64(p, true)
+        p += 16
+        break
+      case 0x7f:
+      case 0xff:
+        break
+      default:
+        throw new Error(`bson: unknown element type 0x${type.toString(16)}`)
+    }
+  }
+  return { value: out, length: total }
+}
+
+// ------------------------------------------------------------ 云存储文件通道
+// 控制台「云存储」对话框走的是另一套通道：先 POST /v1/instances/{id}/tat/session
+// 拿连接参数，再连上腾讯云 TAT 的 websocket，用 BSON 帧读文件（PtyReadFile）。
+// 它和 debug/exec 是两个独立的中继——exec 那个坏掉（502）的时候这条照常工作
+// （2026-11-16 在国际版实测：列目录、读 .env 全通）。插件首选这条通道读
+// .env，失败了再回退 debug/exec。
+const ENV_PATH = "/home/agentuser/.hermes/.env"
+
+function parseEnvText(text) {
+  const grab = (name) => {
+    const m = new RegExp(`^[ \\t]*${name}=(.*)$`, "m").exec(text)
+    return trim(m?.[1]).replace(/"/g, "").replace(/\r$/, "")
+  }
+  return { key: grab("CUSTOM_API_KEY"), base: grab("CUSTOM_BASE_URL") }
+}
+
+async function readEnvViaFileChannel(ed, token, inst) {
+  if (typeof WebSocket === "undefined") throw new Error("当前运行环境没有 WebSocket，文件通道不可用")
+  const bootRes = await call(ed, `/v1/instances/${encodeURIComponent(inst.instance_id)}/tat/session`, {
+    method: "POST",
+    token,
+  })
+  const b = bootRes?.data ?? bootRes
+  if (!b?.wsUrl || !b?.sessionId) throw new Error("tat/session 没有返回连接信息")
+  const channelId = `file-${b.sessionId}`
+  return await new Promise((resolve, reject) => {
+    const ws = new WebSocket(b.wsUrl)
+    ws.binaryType = "arraybuffer"
+    let settled = false
+    const chunks = []
+    const reqId = `file_${Date.now().toString(36)}_env`
+    const timer = setTimeout(() => done(new Error("文件通道超时")), 45_000)
+    function done(err, text) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        ws.send(JSON.stringify({ Type: "PtyStop", Data: { SessionId: b.sessionId, ChannelId: channelId } }))
+      } catch {}
+      try {
+        ws.close()
+      } catch {}
+      if (err) reject(err)
+      else resolve(text)
+    }
+    ws.onopen = () => {
+      try {
+        ws.send(
+          JSON.stringify({
+            Type: "SessionAuth",
+            Data: { Uin: b.ownerUin, AppId: b.appId, InstanceId: b.instanceId, SessionId: b.sessionId },
+          }),
+        )
+        setTimeout(() => {
+          try {
+            ws.send(
+              JSON.stringify({
+                Type: "PtyStart",
+                Data: {
+                  SessionId: b.sessionId,
+                  ChannelId: channelId,
+                  UserName: "",
+                  Cols: b.cols ?? 120,
+                  Rows: b.rows ?? 32,
+                  NoShell: true,
+                  MaxIdleTime: b.timeoutSeconds ?? 3600,
+                },
+              }),
+            )
+          } catch {}
+        }, 300)
+      } catch (e) {
+        done(e)
+      }
+    }
+    ws.onmessage = (ev) => {
+      let doc = null
+      try {
+        doc = typeof ev.data === "string" ? JSON.parse(ev.data) : bsonDecode(new Uint8Array(ev.data)).value
+      } catch {
+        return
+      }
+      const type = typeof doc?.Type === "string" ? doc.Type : ""
+      if (type === "PtyError" || type === "Error") {
+        done(new Error("文件通道被实例拒绝"))
+        return
+      }
+      if (type === "PtyReady") {
+        try {
+          ws.send(
+            bsonEncode({
+              Type: "PtyReadFile",
+              Data: {
+                SessionId: b.sessionId,
+                ChannelId: channelId,
+                CustomData: reqId,
+                Data: { Path: ENV_PATH, Offset: 0, Size: 1048576 },
+              },
+            }),
+          )
+        } catch (e) {
+          done(e)
+        }
+        return
+      }
+      const inner = doc?.Data && typeof doc.Data === "object" ? doc.Data : null
+      if (!inner || inner.CustomData !== reqId) return
+      const payload = inner.Data && typeof inner.Data === "object" ? inner.Data : {}
+      if (typeof payload.Error === "string" && payload.Error) {
+        done(new Error(payload.Error))
+        return
+      }
+      const bytes = payload.Data instanceof Uint8Array ? payload.Data : new Uint8Array(0)
+      chunks.push({
+        bytes,
+        offset: Number(payload.Offset ?? 0),
+        length: Number(payload.Length ?? bytes.length),
+      })
+      if (payload.IsLast === true) {
+        chunks.sort((x, y) => x.offset - y.offset)
+        const total = chunks.reduce((s, c) => Math.max(s, c.offset + c.length), 0)
+        const buf = new Uint8Array(total)
+        for (const c of chunks) buf.set(c.bytes.subarray(0, c.length), c.offset)
+        done(null, new TextDecoder().decode(buf))
+      }
+    }
+    ws.onerror = () => done(new Error("文件通道连接失败"))
+    ws.onclose = () => done(new Error("文件通道被关闭"))
+  })
+}
+
 async function readKey(ed, token, log) {
   const inst = await pickInstance(ed, token)
   log?.(`LightVela (${ed.label}): reading ${inst.name || inst.instance_id} (${inst.status || "?"})`)
+  // 首选云存储文件通道；通道本身报错才回退 debug/exec。文件读到了但里面没有
+  // key 是确定性结论，不回退、直接报清楚。
+  let fileText = null
+  try {
+    fileText = await readEnvViaFileChannel(ed, token, inst)
+  } catch (e) {
+    log?.(`LightVela (${ed.label}): file channel unavailable (${e.message}); falling back to debug/exec`)
+  }
+  if (fileText !== null) {
+    const env = parseEnvText(fileText)
+    if (!env.key) {
+      throw new Error("实例的 .env 里没有 CUSTOM_API_KEY —— 这个账号可能还没配好模型")
+    }
+    return {
+      key: env.key,
+      baseURL: env.base || ed.tokenBase,
+      instanceId: inst.instance_id,
+      instanceName: inst.name || inst.instance_id,
+    }
+  }
   const out = await call(ed, `/v1/instances/${encodeURIComponent(inst.instance_id)}/debug/exec`, {
     method: "POST",
     token,
@@ -920,6 +1275,10 @@ export const _internal = {
   tokenOf,
   userOf,
   readKey,
+  readEnvViaFileChannel,
+  parseEnvText,
+  bsonEncode,
+  bsonDecode,
   resolveToken,
   resolveTokenWithKey,
   authResult,
